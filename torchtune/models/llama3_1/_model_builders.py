@@ -17,6 +17,66 @@ the llama3_1_8b model builder uses the llama3 component builder to create the
 Llama3.1 8B model.
 """
 
+def llama3_1_swarm_400m() -> TransformerDecoder:
+    """
+    Builder for creating a Llama3.1 model initialized w/ the default 8b parameter values.
+
+    Returns:
+        TransformerDecoder: Instantiation of Llama3.1 8B model
+    """
+    return llama3_1(
+        vocab_size=50265,
+        num_layers=20,
+        num_heads=16,
+        num_kv_heads=8,
+        embed_dim=1024,
+        max_seq_len=2048,
+        intermediate_dim=3840,
+        attn_dropout=0.0,
+        norm_eps=1e-5,
+        rope_base=500_000,
+    )
+
+def tt_2_7b() -> TransformerDecoder:
+    """
+    Builder for creating a Llama3.1 model initialized w/ the default 8b parameter values.
+
+    Returns:
+        TransformerDecoder: Instantiation of Llama3.1 8B model
+    """
+    
+    return llama3_1(
+        vocab_size=128_256,
+        num_layers=8,
+        num_heads=32,
+        num_kv_heads=8,
+        embed_dim=4096,
+        max_seq_len=2048,
+        intermediate_dim=14336,
+        attn_dropout=0.0,
+        norm_eps=1e-5,
+        rope_base=500_000,
+    )
+
+def llama3_1_2b() -> TransformerDecoder:
+    """
+    Builder for creating a Llama3.1 model initialized w/ the default 8b parameter values.
+
+    Returns:
+        TransformerDecoder: Instantiation of Llama3.1 8B model
+    """
+    return llama3_1(
+        vocab_size=128_256,
+        num_layers=8,
+        num_heads=32,
+        num_kv_heads=8,
+        embed_dim=4096,
+        max_seq_len=1024,
+        intermediate_dim=14336,
+        attn_dropout=0.0,
+        norm_eps=1e-5,
+        rope_base=500_000,
+    )
 
 def llama3_1_8b() -> TransformerDecoder:
     """
@@ -80,6 +140,42 @@ def llama3_1_405b() -> TransformerDecoder:
         rope_base=500_000,
     )
 
+
+def lora_llama3_1_swarm_400m(
+        lora_attn_modules: List[LORA_ATTN_MODULES],
+    apply_lora_to_mlp: bool = False,
+    apply_lora_to_output: bool = False,
+    lora_rank: int = 8,
+    lora_alpha: float = 16,
+    lora_dropout: float = 0.0,
+    use_dora: bool = False,
+    quantize_base: bool = False,) -> TransformerDecoder:
+    """
+    Builder for creating a Llama3.1 model initialized w/ the default 8b parameter values.
+
+    Returns:
+        TransformerDecoder: Instantiation of Llama3.1 8B model
+    """
+    return lora_llama3_1(
+        lora_attn_modules=lora_attn_modules,
+        apply_lora_to_mlp=apply_lora_to_mlp,
+        apply_lora_to_output=apply_lora_to_output,
+        vocab_size=50265,
+        num_layers=20,
+        num_heads=16,
+        num_kv_heads=8,
+        embed_dim=1024,
+        max_seq_len=2048,
+        intermediate_dim=3840,
+        attn_dropout=0.0,
+        norm_eps=1e-5,
+        rope_base=500_000,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        use_dora=use_dora,
+        quantize_base=quantize_base,
+    )
 
 def lora_llama3_1_8b(
     lora_attn_modules: List[LORA_ATTN_MODULES],

@@ -28,8 +28,10 @@ from ._model_builders import (  # noqa
 )
 from ._prompt_template import Llama2ChatTemplate
 from ._tokenizer import Llama2Tokenizer
+from .gpt_tokenizer import OPTTokenizer
 
 __all__ = [
+    "OPTTokenizer",
     "Llama2Tokenizer",
     "Llama2ChatTemplate",
     "llama2",

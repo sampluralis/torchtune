@@ -251,8 +251,21 @@ def load_from_full_model_state_dict(
         )
     else:
         sharded_sd = {}
+        print("=== meta_sharded_sd keys ===")
+        # for k in meta_sharded_sd.keys():
+        #         print(k)
+
+        print("=== full_sd keys ===")
+        # for k in full_sd.keys():
+        #         print(k)
+
         for param_name, full_tensor in full_sd.items():
+            if param_name == 'freqs_cis':
+                continue
             sharded_meta_param = meta_sharded_sd.get(param_name)
+            
+         #   print(f"ffffffffffffffffffffffffff {param_name}")
+        #    print(f"ffffffffffffffffffffffffff {sharded_meta_param}")
             full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
             if hasattr(sharded_meta_param, "_local_tensor") and isinstance(
                 sharded_meta_param._local_tensor, NF4Tensor

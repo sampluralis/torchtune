@@ -89,7 +89,7 @@ class InferenceRecipe:
                 model_state_dict[k] = v.to(self._device)
             model.load_state_dict(model_state_dict, assign=True)
         else:
-            model.load_state_dict(model_state_dict)
+            model.load_state_dict(model_state_dict,  strict=False)
 
         # Validate model was loaded in with the expected dtype.
         training.validate_expected_param_dtype(

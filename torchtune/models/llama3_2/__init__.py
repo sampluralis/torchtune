@@ -12,11 +12,13 @@ from ._model_builders import (  # noqa
     lora_llama3_2_1b,
     lora_llama3_2_3b,
     qlora_llama3_2_1b,
+    tt_2_7b,
     qlora_llama3_2_3b,
 )
 
 __all__ = [
     "llama3_2",
+    "tt_2_7b"
     "llama3_2_1b",
     "llama3_2_3b",
     "lora_llama3_2",

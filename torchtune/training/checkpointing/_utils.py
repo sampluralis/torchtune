@@ -15,8 +15,25 @@ from warnings import warn
 
 import torch
 from safetensors import safe_open
+import sys
+import types
 
 from torchtune.utils._logging import get_logger
+
+# module_name = "torchtitan.models.llama.model"
+# dummy_module = types.ModuleType(module_name)
+# sys.modules[module_name] = dummy_module
+
+# # Step 2: Define dummy Transformer class
+# class DummyTransformer:
+#     def __init__(self, *args, **kwargs):
+#         pass
+
+# # Step 3: Add dummy Transformer to the dummy module
+# setattr(dummy_module, "Transformer", DummyTransformer)
+
+# # Step 4: Allowlist this dummy Transformer class
+# torch.serialization.add_safe_globals([DummyTransformer])
 
 logger = get_logger("DEBUG")
 

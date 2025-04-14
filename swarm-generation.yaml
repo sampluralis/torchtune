@@ -1,0 +1,48 @@
+# Config for running the InferenceRecipe in generate.py to generate output
+# from Llama2 7B model
+#
+# This config assumes that you've run the following command before launching
+# this run:
+#   tune download meta-llama/Llama-2-7b-hf --output-dir /tmp/Llama-2-7b-hf --ignore-patterns "*.safetensors" --hf-token <HF_TOKEN>
+#
+# To launch, run the following command from root torchtune directory:
+#    tune run generate --config generation
+
+output_dir: ./ # Not needed
+
+# Model arguments
+model:
+  _component_: torchtune.models.llama3_1.llama3_1_swarm_400m
+
+checkpointer:
+  _component_: torchtune.training.FullModelMetaCheckpointer
+  checkpoint_dir: /tmp/torchtune/swarm_fineweb/full_dpo/epoch_0 # /home/ubuntu/torchtitan # /tmp/checkpoints/swarm_400m_v4_grpo/epoch_0 # "/home/ubuntu/torchtune/checkpoints" # /tmp/checkpoints/swarm_400m/epoch_0  # /tmp/torchtune/swarm/lora/epoch_0 # home/ubuntu/torchtune/checkpoints  # /tmp/checkpoints/swarm_400m_ft/epoch_0
+  checkpoint_files: [
+     model-00001-of-00001.bin
+  ]
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+device: cuda
+dtype: bf16
+
+seed: 1234
+
+# Tokenizer arguments
+tokenizer:
+  _component_: torchtune.models.llama2.OPTTokenizer
+  path: facebook/opt-2.7b
+  max_seq_len: null
+  prompt_template: null
+
+# Generation arguments; defaults taken from gpt-fast
+prompt:
+  system: null
+  user: "How many planets are there in the solar system?"
+max_new_tokens: 300
+temperature: 0.6 # 0.8 and 0.6 are popular values to try
+top_k: 300
+
+enable_kv_cache: True
+
+quantizer: null

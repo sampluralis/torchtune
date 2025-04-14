@@ -47,6 +47,8 @@ _FROM_HF = {
 def get_mapped_key(key: str, mapping_dict: Dict[str, str]) -> str:
     try:
         # Checks if there is a layer # in the key
+        # if key == 'freqs_cis':
+        #     return key
         if any(k.isdigit() for k in key.split(".")):
             # Replace layer number with "{}" to create key for lookup
             abstract_key = re.sub(r"(\.\d+)", ".{}", key)
@@ -56,6 +58,7 @@ def get_mapped_key(key: str, mapping_dict: Dict[str, str]) -> str:
         else:
             new_key = mapping_dict[key]
     except KeyError as e:
+        
         raise Exception(
             f'Error converting the state dict. Found unexpected key: "{key}". '
             "Please make sure you're loading a checkpoint with the right format. "
@@ -81,7 +84,9 @@ def meta_to_tune(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]
     """
     converted_state_dict = {}
     for key, value in state_dict.items():
-        if key not in ["rope.freqs"]:  # Skip loading the position embeddings
+     #   print("meta_to_tune")
+        print(key)
+        if key not in ["rope.freqs"] and key not in ["freqs_cis"]:  # Skip loading the position embeddings
             new_key = get_mapped_key(key, _FROM_META)
             converted_state_dict[new_key] = value
 
@@ -104,6 +109,7 @@ def tune_to_meta(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]
     inverted_mapping_dict = {v: k for k, v in _FROM_META.items()}
 
     for key, value in state_dict.items():
+      #  print("tune_to_meta")
         new_key = get_mapped_key(key, inverted_mapping_dict)
         converted_state_dict[new_key] = value
 

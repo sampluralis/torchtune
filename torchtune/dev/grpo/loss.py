@@ -64,8 +64,9 @@ class GRPOLoss(nn.Module):
 
         ratios = torch.exp(pi_logprobs - pi_old_logprobs)  # [B x G, L]
         clipped_ratios = torch.clamp(
-            ratios, 1.0 - self.epsilon, 1.0 + self.epsilon
+            ratios, 1.0 - self.epsilon, 1.0 + self.epsilon + 0.08
         )  # [B x G, L]
+        print("xxx")
 
         advantages = advantages[:, None]  # [B x G, 1]
 

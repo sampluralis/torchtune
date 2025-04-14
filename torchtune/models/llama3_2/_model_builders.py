@@ -16,6 +16,29 @@ Model builders build specific instantiations using component builders. For examp
 the llama3_2_1b model builder uses the llama3_2 component builder to create the
 Llama3.2 1B model.
 """
+
+def tt_2_7b() -> TransformerDecoder:
+    """
+    Builder for creating a Llama3.1 model initialized w/ the default 8b parameter values.
+
+    Returns:
+        TransformerDecoder: Instantiation of Llama3.1 8B model
+    """
+    
+    return llama3_2(
+        vocab_size=128_256,
+        num_layers=8,
+        num_heads=32,
+        num_kv_heads=8,
+        embed_dim=4096,
+        max_seq_len=2048,
+        intermediate_dim=14336,
+        attn_dropout=0.0,
+        norm_eps=1e-5,
+        rope_base=500_000,
+    )
+
+
 def llama3_2_1b(
     tie_word_embeddings: bool = True,
 ) -> TransformerDecoder:
