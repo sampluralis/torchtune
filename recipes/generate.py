@@ -101,28 +101,52 @@ class InferenceRecipe:
 
     def convert_prompt_to_tokens(
         self,
-        prompt: dict[Role, str],
+        prompt: dict[Role, str], autoregressive: bool = False
     ) -> list[int]:
         """
         Convert the prompt string to a user message with optional system messages
         and tokenize using the prompt template defined on the tokenizer.
         """
         messages = []
+
         if "system" in prompt and prompt["system"] is not None:
             messages.append(Message(role="system", content=prompt["system"]))
-        messages.extend(
-            [
-                Message(role="user", content=prompt["user"]),
-                # Empty assistant message to kick-start generation
-                Message(role="assistant", content=""),
-            ]
-        )
+        
+        if autoregressive:
+            assistant = prompt.get("assistant", None)
+            if assistant is not None:
+                messages.extend(
+                [
+                    Message(role="assistant", content=prompt["assistant"] ),
+                ]
+                )
+            else:
+                
+                messages.extend(
+                [
+                    Message(role="assistant", content=""),
+                ]
+                )
+        else:
+            messages.extend(
+                [
+                    Message(role="user", content=prompt["user"]),
+                    # Empty assistant message to kick-start generation
+                    Message(role="assistant", content=""),
+                ]
+            )
+        prompt = self._tokenizer({"messages": messages}, inference=True)
+        input = self._tokenizer.decode(prompt['tokens'], skip_special_tokens=False)
+        print(input)    
         return self._tokenizer({"messages": messages}, inference=True)["tokens"]
 
     @torch.inference_mode()
     def generate(self, cfg: DictConfig):
+
+     #   print("$$$$$$$$$$$$$$$$$$$")
+        autoregressive  = cfg.get("autoregressive", False)
         tokens = self.convert_prompt_to_tokens(
-            cfg.prompt,
+            cfg.prompt, autoregressive
         )
         prompt = torch.tensor(tokens, dtype=torch.int, device=self._device)
 
@@ -137,6 +161,8 @@ class InferenceRecipe:
                     decoder_max_seq_len=prompt.numel() + cfg.max_new_tokens,
                 )
 
+
+        self._model.load_rcv_from_file('global_avg_pcs_3072x60.pt')
         # since quantized model uses torch.compile to get speedup, it needs a warm up / prefill run
         # to get the accurate performance measurement
         if self._quantization_mode is not None:

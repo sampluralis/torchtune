@@ -13,7 +13,7 @@ from torchtune.modules.attention_utils import _MaskType
 
 from torchtune.utils import deprecated
 
-
+import torch.distributed.tensor as dt
 class TransformerSelfAttentionLayer(nn.Module):
     """
     Transformer layer derived from the Llama2 model. Normalization is applied before the attention **and** FF layer.
@@ -328,6 +328,112 @@ def _get_clones(module: nn.Module, n: int) -> nn.ModuleList:
     return nn.ModuleList([copy.deepcopy(module) for i in range(n)])
 
 
+
+@torch.no_grad()
+def _top_k_left_singular_vectors(W: torch.Tensor, k: int = 60, device: str = "cpu"):
+    U, S, Vh = torch.linalg.svd(W.detach().to(device=device, dtype=torch.float32),
+                                full_matrices=False)
+    return U[:, :k]  # (out_features, k)
+
+@torch.no_grad()
+def _stiefel_project(M: torch.Tensor):
+    # Polar factor via SVD; returns orthonormal columns with same shape as M
+    U, _, Vh = torch.linalg.svd(M, full_matrices=False)
+    return U @ Vh
+
+@torch.no_grad()
+def _procrustes_align(A: torch.Tensor, B: torch.Tensor):
+    """
+    Find R = argmin_R ||A R - B||_F  s.t. R^T R = I, where A,B are (d x k) with orthonormal cols.
+    Returns A_aligned = A @ R
+    """
+    # Solve on kxk: (A^T B) = U S V^T, R = U V^T
+    M = A.T @ B  # (k,k)
+    U, _, Vh = torch.linalg.svd(M, full_matrices=False)
+    R = U @ Vh
+    return A @ R
+
+@torch.no_grad()
+def _extract_inner_block(block):
+    # Handle checkpoint/FSDP wrapper if present
+    return getattr(block, "_checkpoint_wrapped_module", block)
+
+@torch.no_grad()
+def layer_basis_from_w2_and_outproj(model, layer_idx: int, k: int = 60, device: str = "cpu"):
+    """
+    Per-layer 3072xk orthonormal basis:
+      1) U_w2  = top-k left singular vectors of mlp.w2.weight
+      2) U_out = top-k left singular vectors of attn.output_proj.weight
+      3) Align U_out to U_w2 (Procrustes), average, project to Stiefel.
+    """
+    block = model.layers[layer_idx]
+    inner = _extract_inner_block(block)
+
+    W2   = inner.mlp.w2.weight               # (3072, 8192)
+    Wout = inner.attn.output_proj.weight     # (3072, 3072)
+
+    U_w2  = _top_k_left_singular_vectors(W2,   k=k, device=device)   # (3072,k)
+    U_out = _top_k_left_singular_vectors(Wout, k=k, device=device)   # (3072,k)
+
+    U_out_aligned = _procrustes_align(U_out, U_w2)                   # align to U_w2
+    M_avg = 0.5 * (U_w2 + U_out_aligned)                             # (3072,k)
+    Q = _stiefel_project(M_avg)                                      # (3072,k)
+    return Q
+
+@torch.no_grad()
+def global_averaged_basis(model, k: int = 60, device: str = "cpu"):
+    """
+    1) Build per-layer bases via layer_basis_from_w2_and_outproj
+    2) Align all to a reference layer's basis (layer 0 by default)
+    3) Average across layers
+    4) Project back to Stiefel to get final (3072 x k) matrix
+    Returns: Q_global (3072,k), per_layer_Q (list of (3072,k) after within-layer averaging, before cross-layer alignment)
+    """
+    num_layers = len(model.layers)
+    per_layer_Q = []
+
+    # If using FSDP with param sharding, consider wrapping this loop with:
+    # from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    # with FSDP.summon_full_params(model, writeback=False, recurse=True):
+    for i in range(num_layers):
+        Q_i = layer_basis_from_w2_and_outproj(model, i, k=k, device=device)  # (3072,k)
+        per_layer_Q.append(Q_i)
+
+    # Cross-layer alignment to a common reference (layer 0)
+    Q_ref = per_layer_Q[0]
+    aligned = [Q_ref]  # first is already the reference
+    for i in range(1, num_layers):
+        aligned.append(_procrustes_align(per_layer_Q[i], Q_ref))  # (3072,k)
+
+    # Average across layers and re-orthonormalize
+    M = torch.stack(aligned, dim=0).mean(dim=0)  # (3072,k)
+    Q_global = _stiefel_project(M)               # (3072,k)
+
+    return Q_global, per_layer_Q
+
+from torch._dynamo import disable 
+@disable
+def _coerce_to_like(x: torch.Tensor, like: torch.Tensor):
+        """
+        Ensure x has the SAME kind (Tensor vs DTensor) and device/mesh as `like`.
+        - If `like` is DTensor: make `x` a replicated DTensor on the same mesh/device.
+        - If `like` is plain Tensor: ensure `x` is a plain Tensor on like.device.
+        """
+        if isinstance(like, dt.DTensor):
+            if isinstance(x, dt.DTensor):
+                return x  # already DTensor
+            # move local tensor to the right device type first (cuda vs cpu)
+            dev_type = getattr(like.device_mesh, "device_type", like.device.type)
+            local_dev = torch.device("cuda", torch.cuda.current_device()) if dev_type == "cuda" else torch.device("cpu")
+            x_local = x.to(local_dev)
+            return dt.distribute_tensor(x_local, device_mesh=like.device_mesh, placements=[dt.Replicate()])
+        else:
+            # like is a regular tensor
+            if isinstance(x, dt.DTensor):
+                # bring back to a local tensor on like.device
+                return x.to_local().to(like.device)
+            return x.to(like.device)   
+
 class TransformerDecoder(nn.Module):
     """
     Transformer Decoder derived from the Llama2 architecture.
@@ -403,6 +509,21 @@ class TransformerDecoder(nn.Module):
         # attributes for KV caches during inference
         self.encoder_max_cache_seq_len = None
         self.decoder_max_cache_seq_len = None
+        self._rcv_cpu = None   # plain CPU tensor (loaded later)
+        self._rcv = None       # Tensor or DTensor (lazy)
+        self._proj = None      # Tensor or DTensor (lazy)
+
+    @torch.no_grad()
+    def load_rcv_from_file(self, path: str):
+        """Call this AFTER you've moved/wrapped the model (e.g., model.to('cuda'), FSDP/DTensor)."""
+        # Trusted file: set weights_only=False (PyTorch 2.6 default changed)
+        rcv = torch.load(path, weights_only=False, map_location="cpu")
+        if not isinstance(rcv, torch.Tensor):
+            raise TypeError(f"Expected Tensor in {path}, got {type(rcv)}")
+        self._rcv_cpu = rcv.detach().contiguous()
+        # Invalidate cached distributed copies if any
+        self._rcv = None
+        self._proj = None
 
     @deprecated("Please use LinearCrossEntropyLoss instead")
     def set_num_output_chunks(self, num_output_chunks: int) -> None:
@@ -571,6 +692,26 @@ class TransformerDecoder(nn.Module):
                     "KV-caches are setup for inference mode, input positions must be provided!"
                 )
 
+    
+
+    @disable
+    def _ensure_proj_ready(self, like_tensor: torch.Tensor):
+        """
+        Build/cast self._proj so it matches `like_tensor` (Tensor vs DTensor, device/mesh).
+        """
+        if getattr(self, "_proj", None) is None:
+            # Build from stored CPU copy of rcv (shape 3072x60)
+            if getattr(self, "_rcv_cpu", None) is None:
+                raise RuntimeError("RCV not loaded; call load_rcv_from_file(...) after wrapping/moving the model.")
+            rcv_local = self._rcv_cpu.to(dtype=like_tensor.dtype).contiguous()
+            # First, make rcv match `like_tensor` kind/device
+            rcv = _coerce_to_like(rcv_local, like_tensor)
+            # Compute P = rcv @ rcv^T in the SAME kind (DTensor or Tensor)
+            self._proj = rcv @ rcv.mT  # (3072,3072)
+
+        # Even if it already exists, ensure it matches `like_tensor` kind/device (cheap no-op if already matching)
+        self._proj = _coerce_to_like(self._proj, like_tensor)
+
     def forward(
         self,
         tokens: Optional[torch.Tensor],
@@ -652,6 +793,7 @@ class TransformerDecoder(nn.Module):
         h = self.tok_embeddings(tokens) if input_embeds is None else input_embeds
 
         hidden = []
+      #  self._ensure_proj_ready(h)
         for i, layer in enumerate(self.layers):
             if i in self.output_hidden_states:
                 hidden.append(h)
@@ -663,6 +805,10 @@ class TransformerDecoder(nn.Module):
                 encoder_mask=encoder_mask,
                 input_pos=input_pos,
             )
+          #  if i < len(list(self.layers)) - 2:
+                #h = h@self.rcv@self.rcv.T
+             #   h = h @ self._proj
+          #  print(h.shape)
 
         if len(self.layers) in self.output_hidden_states:
             hidden.append(h)

@@ -50,6 +50,113 @@ from torchtune.training.quantization import (
 from tqdm import tqdm
 
 
+@torch.no_grad()
+def _top_k_left_singular_vectors(W: torch.Tensor, k: int = 60, device: str = "cpu"):
+    U, S, Vh = torch.linalg.svd(W.detach().to(device=device, dtype=torch.float32),
+                                full_matrices=False)
+    return U[:, :k]  # (out_features, k)
+
+@torch.no_grad()
+def _stiefel_project(M: torch.Tensor):
+    # Polar factor via SVD; returns orthonormal columns with same shape as M
+    U, _, Vh = torch.linalg.svd(M, full_matrices=False)
+    return U @ Vh
+
+@torch.no_grad()
+def _procrustes_align(A: torch.Tensor, B: torch.Tensor):
+    """
+    Find R = argmin_R ||A R - B||_F  s.t. R^T R = I, where A,B are (d x k) with orthonormal cols.
+    Returns A_aligned = A @ R
+    """
+    # Solve on kxk: (A^T B) = U S V^T, R = U V^T
+    M = A.T @ B  # (k,k)
+    U, _, Vh = torch.linalg.svd(M, full_matrices=False)
+    R = U @ Vh
+    return A @ R
+
+@torch.no_grad()
+def _extract_inner_block(block):
+    # Handle checkpoint/FSDP wrapper if present
+    return getattr(block, "_checkpoint_wrapped_module", block)
+
+@torch.no_grad()
+def layer_basis_from_w2_and_outproj(model, layer_idx: int, k: int = 60, device: str = "cpu"):
+    """
+    Per-layer 3072xk orthonormal basis:
+      1) U_w2  = top-k left singular vectors of mlp.w2.weight
+      2) U_out = top-k left singular vectors of attn.output_proj.weight
+      3) Align U_out to U_w2 (Procrustes), average, project to Stiefel.
+    """
+    block = model.layers[layer_idx]
+    inner = _extract_inner_block(block)
+
+    W2   = inner.mlp.w2.weight               # (3072, 8192)
+    Wout = inner.attn.output_proj.weight     # (3072, 3072)
+
+    U_w2  = _top_k_left_singular_vectors(W2,   k=k, device=device)   # (3072,k)
+    U_out = _top_k_left_singular_vectors(Wout, k=k, device=device)   # (3072,k)
+
+    U_out_aligned = _procrustes_align(U_out, U_w2)                   # align to U_w2
+    M_avg = 0.5 * (U_w2 + U_out_aligned)                             # (3072,k)
+    Q = _stiefel_project(M_avg)                                      # (3072,k)
+    return Q
+
+@torch.no_grad()
+def global_averaged_basis(model, k: int = 60, device: str = "cpu"):
+    """
+    1) Build per-layer bases via layer_basis_from_w2_and_outproj
+    2) Align all to a reference layer's basis (layer 0 by default)
+    3) Average across layers
+    4) Project back to Stiefel to get final (3072 x k) matrix
+    Returns: Q_global (3072,k), per_layer_Q (list of (3072,k) after within-layer averaging, before cross-layer alignment)
+    """
+    num_layers = len(model.layers)
+    per_layer_Q = []
+
+    # If using FSDP with param sharding, consider wrapping this loop with:
+    # from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    # with FSDP.summon_full_params(model, writeback=False, recurse=True):
+    for i in range(num_layers):
+        Q_i = layer_basis_from_w2_and_outproj(model, i, k=k, device=device)  # (3072,k)
+        per_layer_Q.append(Q_i)
+
+    # Cross-layer alignment to a common reference (layer 0)
+    Q_ref = per_layer_Q[0]
+    aligned = [Q_ref]  # first is already the reference
+    for i in range(1, num_layers):
+        aligned.append(_procrustes_align(per_layer_Q[i], Q_ref))  # (3072,k)
+
+    # Average across layers and re-orthonormalize
+    M = torch.stack(aligned, dim=0).mean(dim=0)  # (3072,k)
+    Q_global = _stiefel_project(M)               # (3072,k)
+
+    return Q_global, per_layer_Q
+
+
+def freeze_all_but_w2_outproj(model: nn.Module):
+    # Freeze everything
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    # Unfreeze only mlp.w2 and attn.output_proj in each layer
+    n_w2 = n_out = 0
+    for layer in model.layers:
+        inner = getattr(layer, "_checkpoint_wrapped_module", layer)  # handle FSDP/ckpt wrapper
+
+        if hasattr(inner, "mlp") and hasattr(inner.mlp, "w2"):
+            if hasattr(inner.mlp.w2, "weight"):
+                inner.mlp.w2.weight.requires_grad_(True); n_w2 += 1
+            if getattr(inner.mlp.w2, "bias", None) is not None:
+                inner.mlp.w2.bias.requires_grad_(True)
+
+        if hasattr(inner, "attn") and hasattr(inner.attn, "output_proj"):
+            if hasattr(inner.attn.output_proj, "weight"):
+                inner.attn.output_proj.weight.requires_grad_(True); n_out += 1
+            if getattr(inner.attn.output_proj, "bias", None) is not None:
+                inner.attn.output_proj.bias.requires_grad_(True)
+
+    print(f"unfroze w2: {n_w2} layers, output_proj: {n_out} layers")
+
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
     """
     Full finetuning recipe for dense transformer-based LLMs such as Llama2. This recipe supports
@@ -952,7 +1059,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         """
         # clean up before training begins
         training.cleanup_before_training()
-
+        freeze_all_but_w2_outproj(self._model)
         # zero out the gradients before starting training
         if not self._optimizer_in_bwd:
             self._optimizer.zero_grad()
@@ -960,13 +1067,30 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             for opt in self._optim_ckpt_wrapper.optim_map.values():
                 opt.zero_grad()
 
+
+# (optional but recommended) free momentum/Adam states for frozen params to save memory
+        if not self._optimizer_in_bwd:
+            for p in list(self._optimizer.state.keys()):
+                if not p.requires_grad:
+                    self._optimizer.state.pop(p, None)
+        else:
+            for opt in self._optim_ckpt_wrapper.optim_map.values():
+                for p in list(opt.state.keys()):
+                    if not p.requires_grad:
+                        opt.state.pop(p, None)
         # Initialize tokens count and running loss (for grad accumulation)
         t0 = time.perf_counter()
         running_loss = 0
         num_tokens = 0
 
         self._profiler.start()
+        
+        # print(self._model)
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
+
+     #   Q_global, per_layer_Q = global_averaged_basis(self._model, k=1000, device="cuda")
+    #    torch.save(Q_global, "global_avg_pcs_3072x1000.pt")
+        self._model.load_rcv_from_file('global_avg_pcs_3072x1000.pt')
         for curr_epoch in range(self.epochs_run, self.total_epochs):
             inner_step_count = self.global_step % self._steps_per_epoch
             pbar = tqdm(

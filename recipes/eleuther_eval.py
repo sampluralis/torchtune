@@ -39,6 +39,130 @@ from torchtune.modules.transforms.tokenizers import (
 from torchtune.recipe_interfaces import EvalRecipeInterface
 from torchtune.training import FullModelTorchTuneCheckpointer
 
+import csv
+import json
+from typing import Any, Dict, List, Tuple, Optional
+
+def _safe_get_question(sample: Dict[str, Any]) -> str:
+    doc = sample.get("doc", {})
+    # Common fields
+    for key in ["question", "context", "prompt", "input", "text"]:
+        if isinstance(doc, dict) and key in doc and doc[key]:
+            return str(doc[key])
+    # Fallbacks: try first request's context
+    args = sample.get("arguments") or []
+    if args and isinstance(args, list) and len(args[0]) >= 1:
+        ctx = args[0][0]
+        return str(ctx) if ctx is not None else ""
+    return ""
+
+def _get_mc_choices_and_gold(doc: Dict[str, Any]) -> Tuple[List[str], List[int]]:
+    """Return (choices, gold_indices). Supports mc2 first (multi-label), then mc1."""
+    choices, gold = [], []
+    if isinstance(doc, dict):
+        if "mc2_targets" in doc:
+            t = doc["mc2_targets"] or {}
+            choices = list(t.get("choices", []) or [])
+            labels = list(t.get("labels", []) or [])
+            gold = [i for i, v in enumerate(labels) if v]
+            return choices, gold
+        if "mc1_targets" in doc:
+            t = doc["mc1_targets"] or {}
+            choices = list(t.get("choices", []) or [])
+            labels = list(t.get("labels", []) or [])
+            gold = [i for i, v in enumerate(labels) if v]
+            return choices, gold
+    return choices, gold
+
+def _infer_choices_from_arguments(arguments: List[Any]) -> List[str]:
+    """When doc lacks mc1/mc2, fall back to the continuation strings in arguments."""
+    conts = []
+    for a in arguments or []:
+        # Instance.args usually like (context, continuation)
+        if isinstance(a, (list, tuple)) and len(a) >= 2:
+            conts.append(str(a[1]))
+    return conts
+
+def _pick_pred_idx_from_scores(filtered_resps: List[Any]) -> Optional[int]:
+    """
+    filtered_resps is typically a list of tuples like [(score, flag), ...].
+    Return argmax index over score.
+    """
+    try:
+        if not filtered_resps:
+            return None
+        scores = []
+        for r in filtered_resps:
+            # r could be (score, bool) or [[(score, bool)]] depending on nesting
+            if isinstance(r, (list, tuple)) and len(r) >= 1:
+                # Flatten one level if needed (e.g., [(-5.1, False)] )
+                x = r[0] if (len(r) == 1 and isinstance(r[0], (list, tuple))) else r
+                score = float(x[0])
+                scores.append(score)
+            else:
+                return None
+        return max(range(len(scores)), key=lambda i: scores[i])
+    except Exception:
+        return None
+
+def save_eval_qas(output: Dict[str, Any], filepath: str = "eval_qas.csv") -> None:
+    """
+    Writes a CSV with columns:
+      task, question, choices, model_pick_idx, model_pick_text, gold_indices, gold_texts, raw_filtered_resps
+    Works for multiple-choice tasks and degrades gracefully for generation tasks.
+    """
+    samples_by_task = output.get("samples", {})
+    rows = []
+
+    for task_name, task_samples in samples_by_task.items():
+        for s in task_samples:
+            doc = s.get("doc", {}) or {}
+            question = _safe_get_question(s)
+
+            # Choices & gold (from doc if present; else from arguments)
+            choices, gold_idx = _get_mc_choices_and_gold(doc)
+            if not choices:
+                choices = _infer_choices_from_arguments(s.get("arguments", []))
+
+            # Predicted index from filtered_resps (log-likelihood scores)
+            filtered = s.get("filtered_resps", [])
+            pred_idx = _pick_pred_idx_from_scores(filtered)
+
+            # Predicted text
+            pred_text = None
+            if pred_idx is not None and 0 <= pred_idx < len(choices):
+                pred_text = choices[pred_idx]
+            else:
+                # Generation-style fallback: try to surface produced text
+                # Sometimes in lm-eval, 'resps' may already be decoded strings for gen tasks
+                resps = s.get("resps", [])
+                if resps and isinstance(resps[0], str):
+                    pred_text = resps[0]
+                elif isinstance(resps, list) and resps and isinstance(resps[0], list) and resps[0] and isinstance(resps[0][0], str):
+                    pred_text = resps[0][0]
+
+            # Gold texts
+            gold_texts = [choices[i] for i in gold_idx if 0 <= i < len(choices)] if choices and gold_idx else []
+
+            rows.append({
+                "task": task_name,
+                "question": question,
+                "choices": json.dumps(choices, ensure_ascii=False),
+                "model_pick_idx": pred_idx if pred_idx is not None else "",
+                "model_pick_text": pred_text if pred_text is not None else "",
+                "gold_indices": json.dumps(gold_idx),
+                "gold_texts": json.dumps(gold_texts, ensure_ascii=False),
+                "raw_filtered_resps": json.dumps(filtered),
+            })
+
+    fieldnames = ["task", "question", "choices", "model_pick_idx", "model_pick_text", "gold_indices", "gold_texts", "raw_filtered_resps"]
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    print(f"[save_eval_qas] Wrote {len(rows)} rows to {filepath}")
+
 
 class _VLMEvalWrapper(HFMultimodalLM):
     """An EvalWrapper for EleutherAI's eval harness based on gpt-fast's
@@ -281,6 +405,47 @@ class _VLMEvalWrapper(HFMultimodalLM):
         return torch.tensor(generated_tokens, dtype=torch.int32).unsqueeze(0)
 
 
+def _extract_ctx_cont(req):
+    """
+    Works with:
+      - lm-eval Instance objects (req.args -> (context, continuation))
+      - legacy (context, continuation) tuples
+      - dict-like fallbacks
+    """
+    ctx = cont = None
+    # Newer harness: Instance with .args
+    if hasattr(req, "args"):
+        args = getattr(req, "args", ())
+        if isinstance(args, (list, tuple)) and len(args) >= 2:
+            ctx, cont = args[0], args[1]
+    # Legacy: tuple
+    elif isinstance(req, (list, tuple)) and len(req) >= 2:
+        ctx, cont = req[0], req[1]
+    # Fallback: dict-like
+    elif isinstance(req, dict):
+        ctx = req.get("context", None)
+        cont = req.get("continuation", None)
+    return ctx, cont
+
+def _render_chat_with_tokenizer(tokenizer, messages, add_generation_prompt=True):
+    """
+    Uses HF chat_template if available (Llama 3 instruct tokenizers have it).
+    Returns a single rendered string with roles + special tokens.
+    """
+    # If you're wrapping Torchtune's HuggingFaceModelTokenizer:
+    base = getattr(tokenizer, "base_tokenizer", None) or tokenizer
+    if hasattr(base, "apply_chat_template"):
+        return base.apply_chat_template(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=False,
+        )
+    # Fallback: if your custom tokenizer exposes a prompt_template callable
+    if hasattr(tokenizer, "prompt_template"):
+        return tokenizer.prompt_template(messages)
+    # Else: caller should fall back to manual renderer (see Option B)
+    raise RuntimeError("No chat_template available on this tokenizer.")
+
 class _LLMEvalWrapper(HFLM):
     """An EvalWrapper for EleutherAI's eval harness based on gpt-fast's
     EvalWrapper: https://github.com/meta-pytorch/gpt-fast/blob/main/eval.py.
@@ -350,12 +515,23 @@ class _LLMEvalWrapper(HFLM):
     def enable_kv_cache(self):
         return self._enable_kv_cache
 
+    def loglikelihood(self, requests):
+        
+
+        for i, req in enumerate(requests):
+            ctx, cont = _extract_ctx_cont(req)
+            # ctx/cont are plain strings (provided by harness), so print directly
+            print("\n=== SAMPLE", i, "===")
+            print("Q (context):", ctx if ctx is not None else "<missing>")
+            print("A (continuation):", cont if cont is not None else "<missing>")
+        return super().loglikelihood(requests)
     def tok_encode(self, text: str, **kwargs) -> list[int]:
         # Note on add_bos flag: setting to False as this gives better results, for example
         # +1% on truthfulqa_mc2 with a LoRA finetune. lit-gpt also sets this to False,
         # see https://github.com/Lightning-AI/lit-gpt/blob/main/eval/lm_eval_harness.py#L66,
         # though notably fast-gpt does the opposite
         # https://github.com/meta-pytorch/gpt-fast/blob/main/eval.py#L123.
+       # print(f'begin {text} end')
         if isinstance(self._tokenizer, HuggingFaceModelTokenizer):
             return self._tokenizer.base_tokenizer.encode(
                 text=text, add_bos=False, add_eos=False
@@ -365,6 +541,10 @@ class _LLMEvalWrapper(HFLM):
     def tok_batch_encode(
         self, text: list[str], left_truncate_len: int = None, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        
+        print("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
+        # for i, t in enumerate(text):
+        #     print(f"\n=== SAMPLE {i} PROMPT ===\n{t}\n")
         tokenized_text = [self.tok_encode(x) for x in text]
 
         # pad left
@@ -406,7 +586,7 @@ class _LLMEvalWrapper(HFLM):
         self, context: torch.Tensor, **generation_kwargs
     ) -> torch.Tensor:
         bsz, seq_len = context.shape
-
+        print("$##############################")
         temperature = generation_kwargs.get("temperature", 0.0)
         do_sample = generation_kwargs.get("do_sample", False)
         if do_sample or temperature != 0.0:
@@ -439,6 +619,8 @@ class _LLMEvalWrapper(HFLM):
                 pad_id=self._tokenizer.pad_id,
                 stop_tokens=self._tokenizer.stop_tokens,
             )
+
+            print(self.tok_decode(toks[0].tolist()))
         return toks[:bsz]
 
 
@@ -557,6 +739,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
         )
 
     def evaluate(self) -> None:
+        print("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
         # Initialize tasks for the harness
         task_manager = TaskManager(include_path=self.include_path)
         task_dict = get_task_dict(self.tasks, task_manager)
@@ -569,9 +752,30 @@ class EleutherEvalRecipe(EvalRecipeInterface):
             task_dict,
             apply_chat_template=self.apply_chat_template,
             limit=self.limit,
+            log_samples=True,
         )
-        t1 = time.time() - t0
 
+
+        t1 = time.time() - t0
+        import json
+
+        samples = output.get("samples", {})
+        for task_name, task_samples in samples.items():
+            print(f"\n=== Task: {task_name} ===")
+            for s in task_samples:
+                ctx = s.get("doc") or s.get("arguments") or ""
+                target = s.get("target")
+                resps = s.get("resps")          # raw model scores or outputs
+                filtered = s.get("filtered_resps")
+                metrics = s.get("metrics")
+
+                print("\nQ:", json.dumps(ctx, ensure_ascii=False))
+                print("Target (gold):", target)
+                print("Model raw responses:", resps)
+                print("Filtered responses:", filtered)
+                print("Metrics:", metrics)
+        
+        save_eval_qas(output, filepath="eval_qas.csv")
         # Log metrics
         self.logger.info(f"Eval completed in {t1:.02f} seconds.")
         if self.device.type != "cpu" and self.device.type != "mps":

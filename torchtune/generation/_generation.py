@@ -275,6 +275,7 @@ def generate(
                 with shape ``[bsz x num_generated_tokens x vocab_size]``.
     """
     prompt = prompt.view(1, -1) if prompt.ndim == 1 else prompt
+    
 
     bsz, prompt_length = prompt.size()
     total_response_length = prompt_length + max_generated_tokens
@@ -436,6 +437,7 @@ def generate(
                 break
 
     # mask out generated tokens in seqs that already hit a stop token
+   
     if stop_tokens is not None:
         generated_tokens.masked_fill_(~stop_token_mask.bool(), pad_id)
         generated_logits *= stop_token_mask[:, -generated_logits.shape[1] :, None]
